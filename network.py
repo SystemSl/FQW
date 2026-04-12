@@ -11,6 +11,29 @@ import time
 import matplotlib.pyplot as plt
 from matplotlib.colors import hsv_to_rgb
 
+def photometric_loss(left_img, right_img, disp):
+    B, _, H, W = left_img.size()
+
+    curr_grid_y, curr_grid_x = torch.meshgrid(
+        torch.linspace(0, 1, H, device=disp.device),
+        torch.linspace(0, 1, W, device=disp.device),
+        indexing='ij'
+    )
+
+    curr_grid_x = curr_grid_x.expand(B, -1, -1)
+    curr_grid_y = curr_grid_y.expand(B, -1, -1)
+
+    shifted_grid_x = curr_grid_x - (disp.squeeze(1) / W)
+
+    vgrid_x = 2.0 * shifted_grid_x - 1.0
+    vgrid_y = 2.0 * curr_grid_y - 1.0
+
+    vgrid = torch.stack((vgrid_x, vgrid_y), dim=-1)
+
+    reconstructed_left = F.grid_sample(right_img, vgrid, mode='bilinear', padding_mode='border', align_corners=True)
+    
+    return F.l1_loss(reconstructed_left, left_img)
+
 def readPFM(file):
     with open(file, 'rb') as f:
         header = f.readline().rstrip()
@@ -239,7 +262,9 @@ class SceneFlowNet(nn.Module):
         self.dec2 = self.cb(256, 64)
         self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.dec1 = self.cb(128, 32)
-        self.final = nn.Conv2d(32, 4, kernel_size=1)
+        
+        self.final_flow = nn.Conv2d(32, 2, kernel_size=1)
+        self.final_disp = nn.Conv2d(32, 2, kernel_size=1)
 
     def cb(self, in_c, out_c):
         return nn.Sequential(
@@ -257,7 +282,18 @@ class SceneFlowNet(nn.Module):
         d3 = self.dec3(torch.cat([self.up3(d4), e3], 1))
         d2 = self.dec2(torch.cat([self.up2(d3), e2], 1))
         d1 = self.dec1(torch.cat([self.up1(d2), e1], 1))
-        return self.final(d1)
+
+        flow = self.final_flow(d1)
+        disp = self.final_disp(d1)
+
+        h = flow.shape[2]
+        gate = torch.linspace(0.0, 1.0, h, device=x.device).view(1, 1, h, 1)
+        gate = torch.clamp(gate * 5.0, 0.0, 1.0) 
+
+        flow = torch.clamp(flow * gate, -512.0, 512.0)
+        disp = torch.clamp(F.relu(disp) * gate, 0.0, 256.0)
+
+        return torch.cat([flow, disp], dim=1)
 
 class MaskedL1Loss(nn.Module):
     def forward(self, pred, target, mask):
@@ -317,13 +353,22 @@ def run_universal_training(dataset_name, root_dir, pretrained=None, lr=1e-3, epo
             
             if use_mask:
                 inp, tgt, msk = batch
-                out = model(inp)
-                
-                loss_data = criterion_mask(out, tgt, msk)
 
-                loss_smooth = criterion_smooth(out, inp[:, :3]) * 1.0
-                
-                loss = loss_data + loss_smooth
+                out = model(inp) 
+            
+                loss_flow = criterion_mask(out[:, :2], tgt[:, :2], msk[:, :2])
+                loss_disp = criterion_mask(out[:, 2:], tgt[:, 2:], msk[:, 2:])
+
+                ls_flow = criterion_smooth(out[:, :2], inp[:, :3]) * 0.1 
+                ls_disp = criterion_smooth(out[:, 2:], inp[:, :3]) * 1.0
+
+                unm = (1 - msk[:, 2:])
+                h = out.shape[2]
+                yw = torch.linspace(4.0, 0.0, h, device=DEVICE).view(1, 1, h, 1)
+                l_sky = (torch.abs(out[:, 2:]) * unm * yw).mean() * 1.5
+                l_ph = photometric_loss(inp[:, :3], inp[:, 3:6], out[:, 2:3]) * 0.2
+
+                loss = (loss_flow + loss_disp) + ls_flow + ls_disp + l_sky + l_ph
             else: 
                 inp, tgt = batch
                 out = model(inp)
@@ -361,26 +406,26 @@ if __name__ == "__main__":
     #    pretrained=None,
     #    lr=1e-3,
     #    epochs=50,
-    #    save_pref='driving'
+    #    save_pref='driving_new'
     #)
 
     # Этап 2 — дообучение на датасете Driving Fast
     #run_universal_training(
     #    dataset_name='driving',
     #    root_dir='./driving_fast',
-    #    pretrained='driving.pth',
+    #    pretrained='driving_new.pth',
     #    lr=1e-5,
     #    epochs=10,
-    #    save_pref='driving_driving_fast'
+    #    save_pref='driving_driving_fast_new'
     #)
 
     # Этап 3 — дообучение на KITTI
     run_universal_training(
         dataset_name='kitti',
         root_dir='./kitti',
-        pretrained='driving_driving_fast.pth',
+        pretrained='driving_driving_fast_new.pth',
         lr=1e-4,
         epochs=200,
-        save_pref='driving_driving_fast_kitti',
+        save_pref='driving_driving_fast_kitti_new',
         kitti_idxs=KITTI_TRAIN_IDXS
     )

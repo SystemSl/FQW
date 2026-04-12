@@ -1,0 +1,7 @@
+opencv-python
+numpy
+Pillow
+matplotlib
+tqdm
+scipy
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
